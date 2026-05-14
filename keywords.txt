@@ -1,0 +1,19 @@
+#######################################
+# Syntax Coloring Map – MIDIplayer
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1 – orange)
+#######################################
+
+MIDIplayer  KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2 – brown/olive)
+#######################################
+
+begin KEYWORD2
+set_BPM KEYWORD2
+play_MIDI_string  KEYWORD2
+terminate KEYWORD2
+is_playing  KEYWORD2
