@@ -23,4 +23,4 @@ unmute  KEYWORD2
 is_muted  KEYWORD2
 pause KEYWORD2
 resume  KEYWORD2
-is paused KEYWORD2
+is_paused KEYWORD2
