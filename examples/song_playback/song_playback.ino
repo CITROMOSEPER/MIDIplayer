@@ -7,6 +7,10 @@
 
 #define BUZZER_PIN 21     // GPIO pin the PASSIVE piezo buzzer is connected to
 #define TERMINATE_PIN 14  // GPIO pin to terminate the music
+#define PAUSE_PIN 23      // GPIO pin to pause the music
+#define RESUME_PIN 22     // GPIO pin to resume the music
+#define MUTE_PIN 13       // GPIO pin to mute the music
+#define UNMUTE_PIN 27     // GPIO pin to unmute the music
 
 #include <MIDIplayer.h>
 MIDIplayer MIDI(BUZZER_PIN, 220);  // This is the constructor function. Its arguments are: buzzer pin, starting BPM. for advanced users there are two extra: core, priority, but these are not required by default.
@@ -100,5 +104,27 @@ void loop()
   if (digitalRead(TERMINATE_PIN) == HIGH)
   {
     MIDI.terminate();
+  }
+
+  // If pause key is pressed, pause song playback
+  if (digitalRead(PAUSE_PIN) == HIGH)
+  {
+    MIDI.pause();
+  }
+  // If resume key is pressed, pause song playback
+  if (digitalRead(RESUME_PIN) == HIGH)
+  {
+    MIDI.resume();
+  }
+
+  // If mute key is pressed, mute song playback
+  if (digitalRead(MUTE_PIN) == HIGH)
+  {
+    MIDI.pause();
+  }
+  // If unmute key is pressed, unmute song playback
+  if (digitalRead(UNMUTE_PIN) == HIGH)
+  {
+    MIDI.resume();
   }
 }

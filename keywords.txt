@@ -17,3 +17,10 @@ set_BPM KEYWORD2
 play_MIDI_string  KEYWORD2
 terminate KEYWORD2
 is_playing  KEYWORD2
+is_playing  KEYWORD2
+mute  KEYWORD2
+unmute  KEYWORD2
+is_muted  KEYWORD2
+pause KEYWORD2
+resume  KEYWORD2
+is paused KEYWORD2

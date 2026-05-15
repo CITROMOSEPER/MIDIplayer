@@ -25,6 +25,9 @@ MIDIplayer::MIDIplayer(int outputPin, unsigned int BPM, BaseType_t core, UBaseTy
   _core       = core;
   _priority   = priority;
   _terminated = true;
+  _muted      = false;
+  _paused     = false;
+  _currentFreq = 0.0f;
   _taskHandle = nullptr;
 
   // Create the completion semaphore and leave it in the "given" (idle) state.
@@ -33,6 +36,11 @@ MIDIplayer::MIDIplayer(int outputPin, unsigned int BPM, BaseType_t core, UBaseTy
   _doneSem = xSemaphoreCreateBinary();
   configASSERT(_doneSem != nullptr);
   xSemaphoreGive(_doneSem);
+
+  // Create the pause-gate semaphore and leave it in the "given" (running) state.
+  _pauseSem = xSemaphoreCreateBinary();
+  configASSERT(_pauseSem != nullptr);
+  xSemaphoreGive(_pauseSem);
 }
 
 // Initializer function
@@ -57,11 +65,16 @@ void MIDIplayer::set_BPM(unsigned int BPM)
 void MIDIplayer::play_MIDI_string(const String& MIDI_string)
 {
   // Stop any currently running playback and wait for its task to exit cleanly.
+  // terminate() also handles the case where the task is blocked at the pause gate.
   terminate();
 
-  _midiString = MIDI_string;
-  _terminated = false;
-  _octave     = 4;             // sensible default octave
+  _midiString  = MIDI_string;
+  _terminated  = false;
+  _paused      = false;
+  _currentFreq = 0.0f;
+  _octave      = 4;             // sensible default octave
+  // Note: _muted is intentionally NOT reset here — the caller may have
+  // set mute before starting playback, which is a valid use case.
 
   // Take the semaphore to mark the player as busy before creating the task,
   // so that a terminate() call that arrives immediately after play_MIDI_string()
@@ -93,10 +106,22 @@ void MIDIplayer::play_MIDI_string(const String& MIDI_string)
 // any wait list. In the clean-exit path the task suspends itself and we delete
 // the suspended task. Both paths converge on the same vTaskDelete() call so
 // there is no double-delete race.
+//
+// Special case: if the task is blocked at the pause gate we must give back
+// _pauseSem first, otherwise the task never sees _terminated and _doneSem
+// is never signalled — causing a deadlock.
 void MIDIplayer::terminate()
 {
   _terminated = true;
   noTone(_outputPin);
+
+  // If the playback task is currently blocked at the pause gate, unblock it
+  // so it can observe _terminated and proceed to exit cleanly.
+  if (_paused)
+  {
+    _paused = false;
+    xSemaphoreGive(_pauseSem);   // restore token → task unblocks
+  }
 
   TaskHandle_t h = _taskHandle;
   if (h == nullptr) return;   // nothing is playing
@@ -114,11 +139,93 @@ void MIDIplayer::terminate()
   xSemaphoreGive(_doneSem);   // restore to idle state for the next call
 }
 
-// Determine if there is a MIDI string playing currently
+// Determine if there is a MIDI string playing currently.
+// Returns true even while paused — the song is still "active".
 bool MIDIplayer::is_playing()
 {
   return (_taskHandle != nullptr && !_terminated);
 }
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Mute / unmute
+
+// Silence the buzzer without affecting the beat clock. The melody continues
+// to advance in the background; unmuting mid-note restores the tone immediately.
+void MIDIplayer::mute()
+{
+  _muted = true;
+  noTone(_outputPin);
+}
+
+// Restore sound. If a note (not a rest) is currently assigned to the output,
+// tone() is called immediately so the remainder of that beat is audible.
+void MIDIplayer::unmute()
+{
+  _muted = false;
+  float f = _currentFreq;           // atomic 32-bit read on LX6
+  if (f > 0.0f && is_playing() && !_paused)
+  {
+    tone(_outputPin, f);
+  }
+}
+
+bool MIDIplayer::is_muted()
+{
+  return _muted;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Pause / resume
+
+// Freeze playback at the current beat boundary.
+//
+// The buzzer is silenced immediately (this call). The playback task keeps
+// running until it finishes its current vTaskDelayUntil sleep and then
+// blocks at the pause gate — so at most one additional beat elapses before
+// the task actually stops processing new notes. Because noTone() is called
+// right here the user hears silence instantly regardless of that internal delay.
+//
+// Implementation: pause() takes _pauseSem (drives it to 0). The next time
+// the playback loop reaches the gate it finds the semaphore empty and blocks
+// with portMAX_DELAY. resume() gives the semaphore back (drives it to 1),
+// which unblocks the loop.
+void MIDIplayer::pause()
+{
+  if (!is_playing() || _paused) return;
+
+  _paused = true;
+  noTone(_outputPin);
+
+  // Remove the token so the playback loop will block when it next reaches
+  // the gate. portMAX_DELAY is not used here — if the loop just gave the
+  // token back a moment ago, the token is already gone and this returns
+  // immediately. If the loop hasn't reached the gate yet the token is still
+  // present; we take it now so the loop will block when it arrives.
+  xSemaphoreTake(_pauseSem, 0);
+}
+
+// Resume a paused melody from exactly where it stopped.
+//
+// The timing anchor (xLastWakeTime) is reset inside the playback loop
+// immediately after it unblocks, so vTaskDelayUntil measures the next beat
+// from the moment of resumption rather than trying to "catch up" the time
+// that elapsed during the pause.
+void MIDIplayer::resume()
+{
+  if (!_paused) return;
+
+  _paused = false;
+  xSemaphoreGive(_pauseSem);   // unblock the playback loop
+}
+
+// Returns true if the melody is active but currently paused.
+bool MIDIplayer::is_paused()
+{
+  return _paused;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Internal task machinery
 
 // Static trampoline — FreeRTOS needs a plain function pointer,
 // so we bounce into the instance method via the void* parameter.
@@ -148,6 +255,26 @@ void MIDIplayer::_playLoop()
   for (int i = 0; i < length; i++)
   {
     if (_terminated) break;
+
+    // -----------------------------------------------------------------------
+    // Pause gate
+    //
+    // If _paused is true the semaphore token has been removed by pause().
+    // We attempt to take it with portMAX_DELAY which blocks until resume()
+    // gives it back. Once unblocked we immediately give the token back so
+    // that subsequent iterations can also pass through the gate freely.
+    //
+    // After unblocking we reset xLastWakeTime to the current tick so that
+    // vTaskDelayUntil counts the next beat from NOW rather than from before
+    // the pause, which would cause it to return immediately and skip beats.
+    // -----------------------------------------------------------------------
+    if (_paused)
+    {
+      xSemaphoreTake(_pauseSem, portMAX_DELAY);
+      xSemaphoreGive(_pauseSem);              // restore token for future iterations
+      if (_terminated) break;
+      xLastWakeTime = xTaskGetTickCount();    // re-anchor timing after pause
+    }
 
     char letter = _midiString.charAt(i);
 
@@ -179,14 +306,16 @@ void MIDIplayer::_playLoop()
       default:  noteID = 2000; break;  // unrecognized --> no-op, no beat consumed
     }
 
-    
     if (noteID < 85)
     {
-      tone(_outputPin, _frequencies[noteID]);  // play note
+      // Track the active frequency so unmute() can restore the tone mid-note.
+      _currentFreq = _frequencies[noteID];
+      if (!_muted) tone(_outputPin, _currentFreq);  // play note (unless muted)
     }
     else if (noteID == 1000)
     {
-      noTone(_outputPin);                      // rest: silence output for one beat
+      _currentFreq = 0.0f;      // no frequency during a rest
+      noTone(_outputPin);       // rest: silence output for one beat
     }
     // noteID == 2000 (octave select / space): leave output unchanged
 
@@ -200,6 +329,7 @@ void MIDIplayer::_playLoop()
     }
   }
 
+  _currentFreq = 0.0f;
   noTone(_outputPin);
   _terminated = true;
 }
